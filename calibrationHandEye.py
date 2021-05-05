@@ -23,46 +23,82 @@ sys.path.insert(0, os.path.join(prefix, 'repos/mustard'))
 
 from bimvee.importAe import importAe
 
-filePathOrName = os.path.join(prefix,
+filePathOrName = os.path.join(prefix, 
                               'data',
-                              '2020_06_Aiko_Checkerboard',
-                              'trial08',
-                              'StEFI')
+                              '2020_09_30_Aiko_KitchenVicon',
+                              '2020-09-30_calib01')
 
-containerEvents = importAe(filePathOrName=filePathOrName)
+filePathOrName = os.path.join(prefix, 
+                              'data',
+                              '2020_10_08_AikoSim_KitchenVicon',
+                              '2020-10-08_calib00')
+
+containerEvents = importAe(filePathOrName=os.path.join(filePathOrName, 'StEFI'))
+
+#%%
+
+from bimvee.info import info
+
+info(containerEvents)
 
 #%% Run reconstruction
 
 from rpg_e2vid.run_reconstruction import run_reconstruction
 
-exportFilePathOrName = os.path.join(prefix,
-                              'data',
-                              '2020_06_26_Aiko_Checkerboard',
-                              'trial08',
-                              'frames',)
+exportFilePathOrName = os.path.join(filePathOrName,'frames')
 
 kwargs = {}
-kwargs['input_file'] = filePathOrName
+kwargs['input_file'] = filePathOrName=os.path.join(filePathOrName, 'StEFI')
 kwargs['path_to_model'] = os.path.join(prefix, 'repos/rpg_e2vid/pretrained/E2VID_lightweight.pth.tar')
 kwargs['output_folder'] = exportFilePathOrName
 kwargs['auto_hdr'] = True
 kwargs['display'] = True
 kwargs['show_events'] = True
+kwargs['channelName'] = 'right'
 
 run_reconstruction(**kwargs)
 pathToFrames = os.path.join(kwargs['output_folder'], 'reconstruction')
 
+#%% Take those frames and put them in the right place ...
+
 #%% Import frames
 
-containerFrames = importAe(filePathOrName=pathToFrames, zeroTime=False)
+from bimvee.importAe import importAe
+
+containerFrames = importAe(filePathOrName=os.path.join(filePathOrName, 'frames'), 
+                           zeroTime=False)
+
+#%%
+
+from bimvee.info import info
+
+info(containerFrames)
 
 #%% Import poses
+
+import numpy as np
+from bimvee.importAe import importAe
+from bimvee.split import selectByBool
 
 containerVicon = importAe(filePathOrName=os.path.join(filePathOrName, 'Vicon'))
 # Filter out just the desired pose samples
 from bimvee.importIitVicon import separateMarkersFromSegments
 containerVicon['data']['vicon'] = separateMarkersFromSegments(containerVicon['data']['vicon']['pose6q'])
 del containerVicon['data']['vicon']['point3']
+
+# Remove null pose samples (where tracking failed)
+nullPoses = containerVicon['data']['vicon']['pose6q']['point'] == np.zeros((1, 3))
+nullPoses = np.any(nullPoses, axis = 1)
+
+containerVicon['data']['vicon']['pose6q'] = selectByBool(
+    containerVicon['data']['vicon']['pose6q'], ~nullPoses)
+
+
+#%%
+
+from bimvee.info import info
+
+info(containerVicon)
 
 #%% Time alignment
 
@@ -87,7 +123,7 @@ container['data'].update(containerFrames['data'])
 # Now that we've used event data for time alignment, we don't need it any more,
 # so we don't merge in containerEvents
 
-# Check that the container looks correct
+#%% Check that the container looks correct
 from bimvee.info import info
 info(container)
 
@@ -139,10 +175,12 @@ poses = containerObj.getDataType('pose6q')
 import numpy as np
 from bimvee.split import getSamplesAtTimes
 
-numSamples = 100
+numSamples = 300
+firstTime = poses['ts'][0]
 lastTime = poses['ts'][-1]
 frames = getSamplesAtTimes(frames, 
-                           np.arange(0, lastTime, lastTime / numSamples),
+                           np.arange(firstTime, lastTime, 
+                                     (lastTime - firstTime) / numSamples),
                            allowDuplicates = False)
 
 #%% Find checkerboard patterns in the frames
@@ -153,7 +191,10 @@ from bimvee.split import getSamplesAtTimes, selectByBool
 from tqdm import tqdm
 
 # Checkerboard (7x4 vertices, 35mm)
-meshgrid = np.meshgrid(np.arange(7) * 0.035, np.arange(4) * 0.035)
+squareEdgeLength = 0.0383  # m
+checkerboardDims = (5, 4)
+meshgrid = np.meshgrid(np.arange(checkerboardDims[0]) * squareEdgeLength, 
+                       np.arange(checkerboardDims[1]) * squareEdgeLength)
 x = meshgrid[0].flatten()
 y = meshgrid[1].flatten()
 z = np.zeros_like(y)
@@ -165,8 +206,9 @@ coords = np.concatenate((x[:, np.newaxis],
                         axis=1).astype(np.float32)
 usableImagePoints = []
 usableBool = np.zeros((len(frames['frames'])), dtype=np.bool)
-for idx, frame in enumerate(tqdm(frames['frames'])):
-    corners = cv2.findChessboardCorners(frames['frames'][idx], patternSize=(7, 4))
+for idx, frame in enumerate(tqdm(frames['frames'], file=sys.stdout)):
+    corners = cv2.findChessboardCorners(frames['frames'][idx], 
+                                        patternSize=checkerboardDims)
     if corners[0] == True:
         usableBool[idx] = True
         usableImagePoints.append(corners[1][:, 0, :])
@@ -175,7 +217,7 @@ frames['imagePoints'] = usableImagePoints
 
 #%% Select poses which match the frames
 
-poses = getSamplesAtTimes(poses, frames['ts'])
+poses = getSamplesAtTimes(poses, frames['ts'], allowDuplicates=True)
 
 #%% Filter poses too far from frames
 
@@ -214,6 +256,8 @@ frames = getSamplesAtTimes(frames,
 
 #%% Run the calibration
 
+#frames = framesBeforeCalibration 
+
 objectPoints = [coords for idx in range(len(frames['frames']))]
 # camera matrix is an initial guess
 cameraMatrix = np.array([[200, 0, 152],
@@ -232,10 +276,10 @@ retval, cameraMatrix, distCoeffs, rVecs, tVecs = cv2.calibrateCamera(
 frames['rVecs'] = rVecs
 frames['tVecs'] = tVecs
         
-print('Reprojection error: ' + str(retval))
-print('Camera matrix: ')
+print('reprojectionError = ' + str(retval))
+print('cameraMatrix = ')
 print(cameraMatrix)
-print('Distortion cooeficients: ')
+print('distortionCoefficients = ')
 print(distCoeffs)
 
 #%% Calculate the reprojection errors by frame
@@ -261,15 +305,16 @@ reprojectionErrorsSorted = reprojectionErrors.copy()
 reprojectionErrorsSorted.sort()
 plt.figure()
 plt.plot(reprojectionErrorsSorted, 'o')
+plt.xlabel('frame number, sorted by ascending reprojection error')
+plt.ylabel('Mean reprojection error (pixels)')
 
 #%% Select just the frames with the lowest reprojection errors
 
-frames = framesBeforeRejectingHighReprojectionErrors
-
 framesBeforeRejectingHighReprojectionErrors = frames
+# frames = framesBeforeRejectingHighReprojectionErrors
 
 # Use the above result to decide where the threshold should be
-reprojectionErrorThreshold = 0.25
+reprojectionErrorThreshold = 0.2
 
 keepBool = frames['reprojectionErrors'] < reprojectionErrorThreshold 
 frames = selectByBool(frames, keepBool)
@@ -284,6 +329,8 @@ B is transform from dvs camera viewpoint to checkerboard
 
 from bimvee.geometry import quat2RotM
 from calibrone.calibrationFunctions import pose_estimation, invertTransformationMatrices
+
+frames = framesSelectedForHandEyeCalibration 
 
 numFrames = len(frames['frames'])
 
@@ -304,8 +351,11 @@ for idx in range(numFrames):
 a = aViconToStefiRotMats
 b = bAtisToCheckerboardRotMats
 
-x, y, yCheck, errorStats = pose_estimation(aViconToStefiRotMats,
-                 invertTransformationMatrices(bAtisToCheckerboardRotMats))
+
+aInv = invertTransformationMatrices(a)
+bInv = invertTransformationMatrices(b)
+
+x, y, yCheck, errorStats = pose_estimation(a, bInv)
 
 xFinal = x
 yFinal = y
@@ -494,4 +544,47 @@ for idx in range(0, numFrames, 10):
     reprojectedImagePoints = reprojectedImagePoints[:, 0, :]
 
     plt.plot(reprojectedImagePoints[:, 0], reprojectedImagePoints[:, 1], 'or')
+
+#%%
+    
+print('x = ')
+print(xFinal)    
+#%%
+from calibrone.calibrationFunctions import invertTransformationMatrix
+
+xInv = invertTransformationMatrix(xFinal)
+
+print('xInv = ')
+print(xInv)    
+
+
+#%% Visualise hand-eye transformed poses
+
+'''
+Here it's better to revert to the original frame and pose sequence before 
+downsampling
+'''
+
+x = np.array([[-0.01051956,  0.99969537,  0.02232708,  0.04740807],
+              [ 0.99837317,  0.01175173, -0.05579353,  0.08749821],
+              [-0.05603892,  0.02170383, -0.99819266, -0.13020822],
+              [ 0.        ,  0.        ,  0.        ,  1.        ]])
+xInv = np.array([[-0.01051956,  0.99837317, -0.05603892, -0.09415388],
+                 [ 0.99969537,  0.01175173,  0.02170383, -0.04559587],
+                 [ 0.02232708, -0.05579353, -0.99819266, -0.12614954],
+                 [ 0.        ,  0.        ,  0.        ,  1.        ]])
+
+from bimvee.pose import transform
+
+posesTransformed = transform(poses, transformationMatrix=x, direction='reverse')
+posesTransformedInv = transform(poses, transformationMatrix=xInv, direction='reverse')
+
+container['data']['poseTransformed'] = {'pose6q': posesTransformed}
+container['data']['poseTransformedInv'] = {'pose6q': posesTransformedInv}
+
+app.root.data_controller.data_dict = {}
+app.root.data_controller.data_dict = container
+
+
+np.linalg.norm(np.array([0.047, 0.087, 0.13]))
 
